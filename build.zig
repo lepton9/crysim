@@ -1,4 +1,5 @@
 const std = @import("std");
+const zon = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -10,7 +11,7 @@ pub fn build(b: *std.Build) void {
     const run_cli_cmd = b.addRunArtifact(exe_cli);
     run_cli_step.dependOn(&run_cli_cmd.step);
     run_cli_cmd.step.dependOn(b.getInstallStep());
-    // if (b.args) |args| run_cmd.addArgs(args);
+    // if (b.args) |args| run_cli_cmd.addArgs(args);
 
     const run_daemon_step = b.step("daemon", "Run the daemon executable");
     const exe_daemon = setupDaemon(b, target, optimize);
@@ -49,6 +50,15 @@ pub fn setupClientCli(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
 ) *std.Build.Step.Compile {
+    const options = b.addOptions();
+    options.addOption([]const u8, "program_name", @tagName(zon.name));
+
+    const zcli = b.lazyDependency("zcli", .{
+        .target = target,
+        .optimize = optimize,
+        .version_tag = zon.version,
+    });
+
     const exe = b.addExecutable(.{
         .name = "crysim",
         .root_module = b.createModule(.{
@@ -58,6 +68,9 @@ pub fn setupClientCli(
             .imports = &.{},
         }),
     });
+    if (zcli) |m| exe.root_module.addImport("zcli", m.module("zcli"));
+    exe.root_module.addOptions("build_options", options);
+
     b.installArtifact(exe);
     return exe;
 }

@@ -1,6 +1,13 @@
 .{
     .name = .crysim,
     .version = "0.0.1",
+    .dependencies = .{
+        .zcli = .{
+            .url = "git+https://github.com/lepton9/zcli#511faac81dc93a57a262e49354ed60c2105fbc56",
+            .hash = "zcli-0.3.8-Of3s8T2ZAQAzu-KuUAjeSKa-jQnf8SgIWKIKGnvC8wnh",
+            .lazy = true,
+        },
+    },
     .minimum_zig_version = "0.17.0-dev.813+2153f8143",
     .paths = .{""},
     .fingerprint = 0x7b0c9bec77bab6ec,
