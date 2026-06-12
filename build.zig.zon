@@ -1,0 +1,7 @@
+.{
+    .name = .crysim,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.17.0-dev.813+2153f8143",
+    .paths = .{""},
+    .fingerprint = 0x7b0c9bec77bab6ec,
+}
