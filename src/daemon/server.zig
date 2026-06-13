@@ -38,7 +38,7 @@ pub const Server = struct {
             .io = io,
             .gpa = gpa,
             .listen_addr = addr,
-            .server = try addr.listen(io, .{}),
+            .server = try addr.listen(io, .{ .reuse_address = false }),
             .start_ts = std.Io.Clock.boot.now(io),
         };
         try s.initUsers();
@@ -69,7 +69,11 @@ pub const Server = struct {
     }
 
     pub fn stop(self: *Server) void {
-        self.running.store(false, .seq_cst);
+        if (self.running.swap(false, .seq_cst)) {
+            self.server.socket.close(self.io);
+            self.conn_group.cancel(self.io);
+            self.log("Stopping..", .{});
+        }
     }
 
     pub fn coreLoop(self: *Server) std.Io.Cancelable!void {
@@ -80,6 +84,13 @@ pub const Server = struct {
 
     /// Start accepting new connections in a loop.
     pub fn startAccept(self: *Server) std.Io.Cancelable!void {
+        {
+            const b = self.listen_addr.ip4.bytes;
+            self.log(
+                "Listening on {d}.{d}.{d}.{d}:{d}",
+                .{ b[0], b[1], b[2], b[3], self.listen_addr.ip4.port },
+            );
+        }
         while (self.running.load(.seq_cst)) {
             const conn = self.server.accept(self.io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
@@ -195,10 +206,7 @@ pub const Server = struct {
     };
 
     /// Handle the login request and return the created token if succeeded.
-    fn login(
-        self: *Server,
-        req: protocol.Request,
-    ) LoginError!struct {
+    fn login(self: *Server, req: protocol.Request) LoginError!struct {
         token: []const u8,
         role: []const u8,
         expires_at_ms: i64,
@@ -242,9 +250,16 @@ pub const Server = struct {
         };
     }
 
+    fn logout(self: *Server, req: protocol.Request) error{NotLoggedIn}!void {
+        const token = req.token orelse unreachable;
+        const kv = self.sessions.fetchRemove(token) orelse return error.NotLoggedIn;
+        self.gpa.free(kv.key);
+        self.gpa.free(kv.value.username);
+    }
+
     /// Handle the incoming request.
     fn dispatch(self: *Server, req: protocol.Request, w: *std.Io.Writer) void {
-        self.log("Request ({s}), id={d}", .{ @tagName(req.method), req.id });
+        self.log("({s}), id={d}", .{ @tagName(req.method), req.id });
 
         const sess = self.authenticate(req) catch {
             sendErr(w, req.id, .unauthorized, "missing/invalid token");
@@ -269,6 +284,7 @@ pub const Server = struct {
                     },
                     LoginError.OutOfMemory => {
                         sendErr(w, req.id, .internal, "out of memory");
+                        self.oom();
                     },
                 };
                 self.log(
@@ -276,6 +292,13 @@ pub const Server = struct {
                     .{ req.id, res.role, res.expires_at_ms },
                 );
                 return sendOk(w, req.id, res);
+            },
+            .logout => {
+                self.logout(req) catch |err| {
+                    std.debug.assert(err == error.NotLoggedIn);
+                    return sendErr(w, req.id, .unauthorized, "not logged in");
+                };
+                return sendOk(w, req.id, .{ .message = "Logged out" });
             },
             .whoami => {
                 const session = sess orelse unreachable;
@@ -298,5 +321,11 @@ pub const Server = struct {
     fn log(self: *Server, comptime fmt: []const u8, args: anytype) void {
         _ = self;
         std.log.info(fmt, args);
+    }
+
+    fn oom(self: *Server) noreturn {
+        defer self.stop();
+        std.log.err("Out of memory", .{});
+        std.process.exit(1);
     }
 };

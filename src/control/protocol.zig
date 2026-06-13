@@ -3,6 +3,7 @@ const std = @import("std");
 pub const Method = enum {
     health,
     login,
+    logout,
     whoami,
     state,
 };
@@ -11,6 +12,7 @@ pub fn requireAuth(method: Method) bool {
     return switch (method) {
         .health => false,
         .login => false,
+        .logout => true,
         .whoami => true,
         .state => true,
     };
