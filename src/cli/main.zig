@@ -6,4 +6,3 @@ pub fn main(init: std.process.Init) void {
         std.log.err("{}", .{err});
     };
 }
-
