@@ -19,7 +19,6 @@ pub fn requireAuth(method: Method) bool {
 }
 
 // JSON request sent from clients to the daemon.
-// Framing: one JSON object per line (newline-delimited).
 pub const Request = struct {
     id: u64,
     token: ?[]const u8 = null,

@@ -259,12 +259,21 @@ pub const Server = struct {
 
     /// Handle the incoming request.
     fn dispatch(self: *Server, req: protocol.Request, w: *std.Io.Writer) void {
-        self.log("({s}), id={d}", .{ @tagName(req.method), req.id });
-
-        const sess = self.authenticate(req) catch {
+        const sess = self.authenticate(req) catch |err| {
+            self.logErr(
+                "({s}), id={d}, error={s}",
+                .{ @tagName(req.method), req.id, @errorName(err) },
+            );
             sendErr(w, req.id, .unauthorized, "missing/invalid token");
             return;
         };
+
+        if (sess) |s| {
+            self.log(
+                "({s}), id={d}, username={s}, role={s}",
+                .{ @tagName(req.method), req.id, s.username, @tagName(s.role) },
+            );
+        } else self.log("({s}), id={d}", .{ @tagName(req.method), req.id });
 
         switch (req.method) {
             .health => {
@@ -321,6 +330,11 @@ pub const Server = struct {
     fn log(self: *Server, comptime fmt: []const u8, args: anytype) void {
         _ = self;
         std.log.info(fmt, args);
+    }
+
+    fn logErr(self: *Server, comptime fmt: []const u8, args: anytype) void {
+        _ = self;
+        std.log.err(fmt, args);
     }
 
     fn oom(self: *Server) noreturn {

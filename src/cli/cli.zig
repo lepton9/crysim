@@ -4,6 +4,7 @@ const options = @import("build_options");
 
 const crysim = @import("crysim");
 const protocol = crysim.protocol;
+const session = crysim.session;
 
 const Method = protocol.Method;
 
@@ -54,6 +55,63 @@ const commands = &[_]zcli.Cmd{
 const Ctx = struct {
     init: std.process.Init,
     cli: *zcli.Cli,
+    sess: *session.ClientSession,
+};
+
+const CliTokenStore = struct {
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    token: ?[]const u8 = null,
+
+    fn tokenFilePath(self: *const CliTokenStore, gpa: std.mem.Allocator) ![]u8 {
+        const home = self.env.get("HOME") orelse return error.NoHome;
+        return std.Io.Dir.path.join(gpa, &.{ home, DATA_PATH, "token" });
+    }
+
+    fn load(ctxp: *anyopaque, gpa: std.mem.Allocator) anyerror!?[]u8 {
+        const self: *CliTokenStore = @ptrCast(@alignCast(ctxp));
+
+        if (self.token) |token| return try gpa.dupe(u8, token);
+
+        const path = try self.tokenFilePath(gpa);
+        defer gpa.free(path);
+
+        var file = std.Io.Dir.openFileAbsolute(self.io, path, .{
+            .mode = .read_only,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer file.close(self.io);
+
+        var rbuf: [4096]u8 = undefined;
+        var r = std.Io.File.Reader.init(file, self.io, &rbuf);
+        const line = (try r.interface.takeDelimiter('\n')) orelse return null;
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) return null;
+        return try gpa.dupe(u8, trimmed);
+    }
+
+    fn save(ctxp: *anyopaque, token: []const u8) anyerror!void {
+        const self: *CliTokenStore = @ptrCast(@alignCast(ctxp));
+        const home = self.env.get("HOME") orelse return error.NoHome;
+
+        var home_dir = try std.Io.Dir.openDirAbsolute(self.io, home, .{});
+        defer home_dir.close(self.io);
+
+        try home_dir.createDirPath(self.io, DATA_PATH);
+        var cdir = try home_dir.openDir(self.io, DATA_PATH, .{});
+        defer cdir.close(self.io);
+
+        var file = try cdir.createFile(self.io, "token", .{ .truncate = true });
+        defer file.close(self.io);
+
+        var wbuf: [256]u8 = undefined;
+        var w = std.Io.File.Writer.init(file, self.io, &wbuf);
+        try w.interface.writeAll(token);
+        try w.interface.writeAll("\n");
+        try w.interface.flush();
+    }
 };
 
 /// Handle the parsed CLI and call the command function.
@@ -61,74 +119,43 @@ pub fn handleCli(init: std.process.Init) !void {
     const gpa = init.gpa;
     const cli = try zcli.parseInit(init, &spec);
     defer cli.deinit(gpa);
-    var ctx: Ctx = .{ .init = init, .cli = cli };
+
+    var store = CliTokenStore{
+        .io = init.io,
+        .env = init.environ_map,
+        .token = if (cli.findOption("token")) |t| t.value.?.string else null,
+    };
+    const token_store: session.ClientSession.TokenStore = .{
+        .ctx = &store,
+        .load = CliTokenStore.load,
+        .save = CliTokenStore.save,
+    };
+
+    var sess = session.ClientSession.initWithTokenStore(
+        init.io,
+        init.gpa,
+        getConnectOptions(cli),
+        token_store,
+    );
+    defer sess.deinit();
+
+    var ctx: Ctx = .{ .init = init, .cli = cli, .sess = &sess };
     if (cli.cmd) |c| {
         const f = c.exec orelse return;
         try f(&ctx);
     }
 }
 
-fn getConnectOptions(ctx: *const Ctx) protocol.Options {
+fn getConnectOptions(cli: *const zcli.Cli) protocol.Options {
     var opts: protocol.Options = .{};
-    if (ctx.cli.findOption("host")) |o| {
+    if (cli.findOption("host")) |o| {
         opts.host = o.value.?.string;
     }
-    if (ctx.cli.findOption("port")) |o| {
+    if (cli.findOption("port")) |o| {
         if (std.math.cast(u16, o.value.?.int)) |p|
             opts.port = p;
     }
     return opts;
-}
-
-fn tokenFilePath(ctx: *const Ctx, gpa: std.mem.Allocator) ![]u8 {
-    const home = ctx.init.environ_map.get("HOME") orelse return error.NoHome;
-    return std.fmt.allocPrint(gpa, "{s}/{s}/token", .{ home, DATA_PATH });
-}
-
-/// Load the session token from the saved file.
-fn loadToken(ctx: *const Ctx, gpa: std.mem.Allocator) !?[]u8 {
-    if (ctx.cli.findOption("token")) |o| {
-        return try gpa.dupe(u8, o.value.?.string);
-    }
-
-    const path = try tokenFilePath(ctx, gpa);
-    defer gpa.free(path);
-
-    var file = std.Io.Dir.openFileAbsolute(ctx.init.io, path, .{
-        .mode = .read_only,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer file.close(ctx.init.io);
-
-    var rbuf: [4096]u8 = undefined;
-    var r = std.Io.File.Reader.init(file, ctx.init.io, &rbuf);
-    const line = (try r.interface.takeDelimiter('\n')) orelse return null;
-    const trimmed = std.mem.trim(u8, line, " \t\r\n");
-    if (trimmed.len == 0) return null;
-    return try gpa.dupe(u8, trimmed);
-}
-
-/// Save the session token to a file.
-fn saveToken(ctx: *const Ctx, token: []const u8) !void {
-    const home = ctx.init.environ_map.get("HOME") orelse return error.NoHome;
-
-    var home_dir = try std.Io.Dir.openDirAbsolute(ctx.init.io, home, .{});
-    defer home_dir.close(ctx.init.io);
-
-    try home_dir.createDirPath(ctx.init.io, DATA_PATH);
-    var cdir = try home_dir.openDir(ctx.init.io, DATA_PATH, .{});
-    defer cdir.close(ctx.init.io);
-
-    var file = try cdir.createFile(ctx.init.io, "token", .{ .truncate = true });
-    defer file.close(ctx.init.io);
-
-    var wbuf: [256]u8 = undefined;
-    var w = std.Io.File.Writer.init(file, ctx.init.io, &wbuf);
-    try w.interface.writeAll(token);
-    try w.interface.writeAll("\n");
-    try w.interface.flush();
 }
 
 fn printJson(value: anytype) void {
@@ -137,12 +164,7 @@ fn printJson(value: anytype) void {
 
 fn cmdHealth(ctxp: *anyopaque) anyerror!void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctxp));
-    const resp = try protocol.request(
-        ctx.init.io,
-        ctx.init.gpa,
-        getConnectOptions(ctx),
-        .{ .id = 1, .method = Method.health },
-    );
+    const resp = try ctx.sess.request(.health);
     defer resp.deinit();
     printJson(resp.value);
 }
@@ -150,19 +172,13 @@ fn cmdHealth(ctxp: *anyopaque) anyerror!void {
 fn cmdLogin(ctxp: *anyopaque) anyerror!void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctxp));
 
-    const user_pos = ctx.cli.findPositional("username") orelse return error.MissingField;
-    const pass_pos = ctx.cli.findPositional("password") orelse return error.MissingField;
+    const user_pos = ctx.cli.findPositional("username") orelse unreachable;
+    const pass_pos = ctx.cli.findPositional("password") orelse unreachable;
 
-    const resp = try protocol.request(
-        ctx.init.io,
-        ctx.init.gpa,
-        getConnectOptions(ctx),
-        .{
-            .id = 1,
-            .method = Method.login,
-            .params = .{ .username = user_pos.value, .password = pass_pos.value },
-        },
-    );
+    const resp = try ctx.sess.requestParams(.login, protocol.LoginParams{
+        .username = user_pos.value,
+        .password = pass_pos.value,
+    });
     defer resp.deinit();
 
     if (!resp.value.ok) {
@@ -183,51 +199,27 @@ fn cmdLogin(ctxp: *anyopaque) anyerror!void {
     );
     defer parsed.deinit();
 
-    try saveToken(ctx, parsed.value.token);
+    try ctx.sess.saveToken(parsed.value.token);
     printJson(resp.value);
 }
 
 fn cmdLogout(ctxp: *anyopaque) anyerror!void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctxp));
-    const token = (try loadToken(ctx, ctx.init.gpa)) orelse return error.NotLoggedIn;
-    defer ctx.init.gpa.free(token);
-
-    const resp = try protocol.request(
-        ctx.init.io,
-        ctx.init.gpa,
-        getConnectOptions(ctx),
-        .{ .id = 1, .token = token, .method = Method.logout },
-    );
+    const resp = try ctx.sess.request(.logout);
     defer resp.deinit();
     printJson(resp.value);
 }
 
 fn cmdWhoAmI(ctxp: *anyopaque) anyerror!void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctxp));
-    const token = (try loadToken(ctx, ctx.init.gpa)) orelse return error.NotLoggedIn;
-    defer ctx.init.gpa.free(token);
-
-    const resp = try protocol.request(
-        ctx.init.io,
-        ctx.init.gpa,
-        getConnectOptions(ctx),
-        .{ .id = 1, .token = token, .method = Method.whoami },
-    );
+    const resp = try ctx.sess.request(.whoami);
     defer resp.deinit();
     printJson(resp.value);
 }
 
 fn cmdState(ctxp: *anyopaque) anyerror!void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctxp));
-    const token = (try loadToken(ctx, ctx.init.gpa)) orelse return error.NotLoggedIn;
-    defer ctx.init.gpa.free(token);
-
-    const resp = try protocol.request(
-        ctx.init.io,
-        ctx.init.gpa,
-        getConnectOptions(ctx),
-        .{ .id = 1, .token = token, .method = Method.state },
-    );
+    const resp = try ctx.sess.request(.state);
     defer resp.deinit();
     printJson(resp.value);
 }
