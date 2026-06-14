@@ -61,6 +61,7 @@ const commands = &[_]zcli.Cmd{
         .action = cmdCreateUser,
     },
     .{ .name = "sessionlist", .desc = "List all the active sessions", .action = cmdSessionList },
+    .{ .name = "shutdown", .desc = "Shutdown the server", .action = cmdShutdown },
 };
 
 const Ctx = struct {
@@ -253,6 +254,13 @@ fn cmdCreateUser(ctxp: *anyopaque) anyerror!void {
 fn cmdSessionList(ctxp: *anyopaque) anyerror!void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctxp));
     const resp = try ctx.sess.request(.session_list);
+    defer resp.deinit();
+    printJson(resp.value);
+}
+
+fn cmdShutdown(ctxp: *anyopaque) anyerror!void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctxp));
+    const resp = try ctx.sess.request(.shutdown);
     defer resp.deinit();
     printJson(resp.value);
 }

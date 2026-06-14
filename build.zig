@@ -14,13 +14,14 @@ pub fn build(b: *std.Build) void {
     const run_cli_step = b.step("cli", "Run the cli executable");
     const exe_cli = setupClientCli(b, target, optimize, crysim_mod);
     const run_cli_cmd = b.addRunArtifact(exe_cli);
+    run_cli_cmd.addPassthruArgs();
     run_cli_step.dependOn(&run_cli_cmd.step);
     run_cli_cmd.step.dependOn(b.getInstallStep());
-    // if (b.args) |args| run_cli_cmd.addArgs(args);
 
     const run_daemon_step = b.step("daemon", "Run the daemon executable");
     const exe_daemon = setupDaemon(b, target, optimize, crysim_mod);
     const run_daemon_cmd = b.addRunArtifact(exe_daemon);
+    run_daemon_cmd.addPassthruArgs();
     run_daemon_step.dependOn(&run_daemon_cmd.step);
     run_daemon_cmd.step.dependOn(b.getInstallStep());
 

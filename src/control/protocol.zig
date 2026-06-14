@@ -8,6 +8,7 @@ pub const Method = enum {
     state,
     create_user,
     session_list,
+    shutdown,
 };
 
 pub const Rights = struct {
@@ -24,6 +25,7 @@ pub fn requiredRights(method: Method) Rights {
         .state => .{ .auth = true },
         .create_user => .{ .auth = true, .role = .admin },
         .session_list => .{ .auth = true, .role = .admin },
+        .shutdown => .{ .auth = true, .role = .admin },
     };
 }
 

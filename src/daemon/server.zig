@@ -12,6 +12,9 @@ pub const Server = struct {
     users: std.StringHashMapUnmanaged(User) = .{},
     sessions: std.StringHashMapUnmanaged(Session) = .{},
 
+    /// Group for the server loops.
+    run_group: std.Io.Group = .init,
+    /// Group for handling user requests.
     conn_group: std.Io.Group = .init,
 
     const SESSION_LEN_S = 12 * 60 * 60;
@@ -38,11 +41,12 @@ pub const Server = struct {
 
     pub fn init(io: std.Io, gpa: std.mem.Allocator, addr: std.Io.net.IpAddress) !*Server {
         const s = try gpa.create(Server);
+        errdefer gpa.destroy(s);
         s.* = .{
             .io = io,
             .gpa = gpa,
             .listen_addr = addr,
-            .server = try addr.listen(io, .{ .reuse_address = false }),
+            .server = try addr.listen(io, .{ .reuse_address = true }),
             .start_ts = std.Io.Clock.boot.now(io),
         };
         try s.initUsers();
@@ -58,8 +62,6 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         self.running.store(false, .seq_cst);
-        self.conn_group.cancel(self.io);
-        _ = self.conn_group.await(self.io) catch {};
 
         var it = self.sessions.iterator();
         while (it.next()) |e| {
@@ -67,6 +69,12 @@ pub const Server = struct {
             self.gpa.free(e.value_ptr.username);
         }
         self.sessions.deinit(self.gpa);
+
+        var uit = self.users.iterator();
+        while (uit.next()) |e| {
+            self.gpa.free(e.key_ptr.*);
+            self.gpa.free(e.value_ptr.password);
+        }
         self.users.deinit(self.gpa);
         self.server.deinit(self.io);
         self.gpa.destroy(self);
@@ -76,14 +84,21 @@ pub const Server = struct {
         self.run_group.async(self.io, Server.startAccept, .{self});
         self.run_group.async(self.io, Server.coreLoop, .{self});
         self.run_group.async(self.io, Server.cleanupLoop, .{self});
-        self.run_group.await(self.io) catch {};
+
+        while (self.running.load(.seq_cst)) {
+            std.Io.sleep(self.io, .fromMilliseconds(200), .boot) catch {};
+        }
+
+        self.run_group.cancel(self.io);
+        _ = self.run_group.await(self.io) catch {};
+
+        self.conn_group.cancel(self.io);
+        _ = self.conn_group.await(self.io) catch {};
     }
 
     pub fn stop(self: *Server) void {
         if (self.running.swap(false, .seq_cst)) {
-            self.server.socket.close(self.io);
-            self.conn_group.cancel(self.io);
-            self.log("Stopping..", .{});
+            self.log("Stopping the server..", .{});
         }
     }
 
@@ -106,9 +121,9 @@ pub const Server = struct {
             const conn = self.server.accept(self.io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 else => {
+                    if (!self.running.load(.seq_cst)) return;
                     std.log.err("accept failed: {}", .{err});
-                    self.stop();
-                    return error.Canceled;
+                    return;
                 },
             };
             self.conn_group.async(self.io, Server.handleConn, .{ self, conn });
@@ -500,6 +515,9 @@ pub const Server = struct {
                     .sessions = sessions,
                 });
             },
+            .shutdown => {
+                defer self.stop();
+                sendOk(w, req.id, .{ .message = "Shutting down" });
             },
         }
 
