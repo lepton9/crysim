@@ -4,9 +4,10 @@ pub const Method = enum {
     health,
     login,
     logout,
-    create_user,
     whoami,
     state,
+    create_user,
+    session_list,
 };
 
 pub const Rights = struct {
@@ -19,9 +20,10 @@ pub fn requiredRights(method: Method) Rights {
         .health => .{ .auth = false },
         .login => .{ .auth = false },
         .logout => .{ .auth = true },
-        .create_user => .{ .auth = true, .role = .admin },
         .whoami => .{ .auth = true },
         .state => .{ .auth = true },
+        .create_user => .{ .auth = true, .role = .admin },
+        .session_list => .{ .auth = true, .role = .admin },
     };
 }
 

@@ -14,6 +14,9 @@ pub const Server = struct {
 
     conn_group: std.Io.Group = .init,
 
+    const SESSION_LEN_S = 12 * 60 * 60;
+    const CLEANUP_FREQUENCY_S = 5;
+
     const User = struct {
         username: []const u8,
         password: []const u8,
@@ -69,6 +72,13 @@ pub const Server = struct {
         self.gpa.destroy(self);
     }
 
+    pub fn run(self: *Server) void {
+        self.run_group.async(self.io, Server.startAccept, .{self});
+        self.run_group.async(self.io, Server.coreLoop, .{self});
+        self.run_group.async(self.io, Server.cleanupLoop, .{self});
+        self.run_group.await(self.io) catch {};
+    }
+
     pub fn stop(self: *Server) void {
         if (self.running.swap(false, .seq_cst)) {
             self.server.socket.close(self.io);
@@ -79,7 +89,7 @@ pub const Server = struct {
 
     pub fn coreLoop(self: *Server) std.Io.Cancelable!void {
         while (self.running.load(.seq_cst)) {
-            try std.Io.sleep(self.io, std.Io.Duration.fromSeconds(1), .boot);
+            try std.Io.sleep(self.io, .fromSeconds(1), .boot);
         }
     }
 
@@ -105,7 +115,17 @@ pub const Server = struct {
         }
     }
 
-    fn nowBoot(self: *Server) std.Io.Timestamp {
+    /// Cleanup expired sessions periodically.
+    pub fn cleanupLoop(self: *Server) std.Io.Cancelable!void {
+        while (self.running.load(.seq_cst)) {
+            try std.Io.sleep(self.io, .fromSeconds(CLEANUP_FREQUENCY_S), .boot);
+            self.cleanupExpiredSessions() catch |err| {
+                self.logErr("Failed to cleanup ({s})", .{@errorName(err)});
+            };
+        }
+    }
+
+    fn nowBoot(self: *const Server) std.Io.Timestamp {
         return std.Io.Clock.boot.now(self.io);
     }
 
@@ -142,11 +162,16 @@ pub const Server = struct {
         out_hex.* = std.fmt.bytesToHex(buf.*, .lower);
     }
 
+    /// Check if the session is expired.
+    fn isExpired(self: *const Server, session: *const Session) bool {
+        return (session.expires_at.compare(.lte, self.nowBoot().withClock(.boot)));
+    }
+
     /// Get the session matching the token or cleanup if expired.
     fn requireSession(self: *Server, token: ?[]const u8) !Session {
         const t = token orelse return error.NotLoggedIn;
         const sess = self.sessions.get(t) orelse return error.InvalidSessionToken;
-        if (sess.expires_at.compare(.lte, nowBoot(self).withClock(.boot))) {
+        if (self.isExpired(&sess)) {
             // Cleanup of expired token
             if (self.sessions.fetchRemove(t)) |kv| {
                 self.gpa.free(kv.key);
@@ -216,6 +241,58 @@ pub const Server = struct {
         return gop.value_ptr;
     }
 
+    /// Get all the current sessions.
+    fn getSessions(self: *Server) error{OutOfMemory}!std.ArrayList(*Session) {
+        var sessions: std.ArrayList(*Session) = try .initCapacity(self.gpa, self.sessions.size);
+        errdefer sessions.deinit(self.gpa);
+        var it = self.sessions.valueIterator();
+        while (it.next()) |s| sessions.appendAssumeCapacity(s);
+        return sessions;
+    }
+
+    /// Clean up all the sessions that have expired.
+    fn cleanupExpiredSessions(self: *Server) !void {
+        var expired: std.ArrayList([]const u8) = .empty;
+        defer expired.deinit(self.gpa);
+        var it = self.sessions.iterator();
+        while (it.next()) |e| {
+            const session = e.value_ptr;
+            if (!self.isExpired(session)) continue;
+            try expired.append(self.gpa, e.key_ptr.*);
+        }
+        for (expired.items) |token| {
+            const kv = self.sessions.fetchRemove(token) orelse continue;
+            self.gpa.free(kv.key);
+            self.gpa.free(kv.value.username);
+        }
+    }
+
+    /// Revoke all the sessions for the user.
+    fn revokeSessionsUsername(self: *Server, username: []const u8) !void {
+        var expired: std.ArrayList([]const u8) = .empty;
+        defer expired.deinit(self.gpa);
+        var it = self.sessions.iterator();
+        while (it.next()) |e| {
+            if (!std.mem.eql(u8, e.value_ptr.username, username)) continue;
+            try expired.append(self.gpa, e.key_ptr.*);
+        }
+        for (expired.items) |token| {
+            const kv = self.sessions.fetchRemove(token) orelse continue;
+            self.gpa.free(kv.key);
+            self.gpa.free(kv.value.username);
+        }
+    }
+
+    /// Revoke all the sessions.
+    fn revokeSessionsAll(self: *Server) void {
+        var it = self.sessions.iterator();
+        while (it.next()) |e| {
+            self.gpa.free(e.key_ptr.*);
+            self.gpa.free(e.value_ptr.username);
+        }
+        self.sessions.clearAndFree(self.gpa);
+    }
+
     /// Check if the user is logged in and has enough rights.
     ///
     /// Skips check if the requested method does not require authentication.
@@ -270,7 +347,8 @@ pub const Server = struct {
         errdefer self.gpa.free(username);
 
         const now_ts = nowBoot(self);
-        const expires_at = now_ts.addDuration(std.Io.Duration.fromSeconds(12 * 60 * 60));
+        const expires_at = now_ts.addDuration(std.Io.Duration.fromSeconds(SESSION_LEN_S));
+        self.revokeSessionsUsername(username) catch {};
         try self.sessions.put(self.gpa, token, .{
             .username = username,
             .role = user.role,
@@ -371,6 +449,20 @@ pub const Server = struct {
                 };
                 return sendOk(w, req.id, .{ .message = "Logged out" });
             },
+            .whoami => {
+                const session = sess orelse unreachable;
+                return sendOk(w, req.id, .{
+                    .username = session.username,
+                    .role = @tagName(session.role),
+                    .expires_at_ms = session.expires_at.raw.toMilliseconds(),
+                });
+            },
+            .state => {
+                const session = sess orelse unreachable;
+                _ = session;
+                // TODO:
+                return sendOk(w, req.id, .{ .balance = 0 });
+            },
             .create_user => {
                 const user = self.createUser(req) catch |err| return switch (err) {
                     RequestError.MissingParams => {
@@ -400,18 +492,14 @@ pub const Server = struct {
                     .role = @tagName(user.role),
                 });
             },
-            .whoami => {
-                const session = sess orelse unreachable;
+            .session_list => {
+                var sessions = self.getSessions() catch self.oom();
+                defer sessions.deinit(self.gpa);
+                // TODO:
                 return sendOk(w, req.id, .{
-                    .username = session.username,
-                    .role = @tagName(session.role),
-                    .expires_at_ms = session.expires_at.raw.toMilliseconds(),
+                    .sessions = sessions,
                 });
             },
-            .state => {
-                const session = sess orelse unreachable;
-                _ = session;
-                return sendOk(w, req.id, .{ .balance = 0 });
             },
         }
 

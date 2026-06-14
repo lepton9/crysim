@@ -48,6 +48,8 @@ const commands = &[_]zcli.Cmd{
         .{ .name = "password", .desc = "Password", .required = true },
     }, .action = cmdLogin },
     .{ .name = "logout", .desc = "Logout from the session", .action = cmdLogout },
+    .{ .name = "whoami", .desc = "Show current session", .action = cmdWhoAmI },
+    .{ .name = "state", .desc = "Get current state", .action = cmdState },
     .{
         .name = "createuser",
         .desc = "Create a new user",
@@ -58,8 +60,7 @@ const commands = &[_]zcli.Cmd{
         },
         .action = cmdCreateUser,
     },
-    .{ .name = "whoami", .desc = "Show current session", .action = cmdWhoAmI },
-    .{ .name = "state", .desc = "Get current state", .action = cmdState },
+    .{ .name = "sessionlist", .desc = "List all the active sessions", .action = cmdSessionList },
 };
 
 const Ctx = struct {
@@ -246,6 +247,13 @@ fn cmdCreateUser(ctxp: *anyopaque) anyerror!void {
     );
     defer parsed.deinit();
 
+    printJson(resp.value);
+}
+
+fn cmdSessionList(ctxp: *anyopaque) anyerror!void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctxp));
+    const resp = try ctx.sess.request(.session_list);
+    defer resp.deinit();
     printJson(resp.value);
 }
 
