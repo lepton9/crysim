@@ -4,17 +4,33 @@ pub const Method = enum {
     health,
     login,
     logout,
+    create_user,
     whoami,
     state,
 };
 
-pub fn requireAuth(method: Method) bool {
+pub const Rights = struct {
+    auth: bool,
+    role: ?Role = null,
+};
+
+pub fn requiredRights(method: Method) Rights {
     return switch (method) {
-        .health => false,
-        .login => false,
-        .logout => true,
-        .whoami => true,
-        .state => true,
+        .health => .{ .auth = false },
+        .login => .{ .auth = false },
+        .logout => .{ .auth = true },
+        .create_user => .{ .auth = true, .role = .admin },
+        .whoami => .{ .auth = true },
+        .state => .{ .auth = true },
+    };
+}
+
+pub fn hasEnoughRights(rights: Rights, role: Role) bool {
+    const needed = rights.role orelse return true;
+    return switch (needed) {
+        .viewer => role == .admin or role == .trader or role == .viewer,
+        .trader => role == .admin or role == .trader,
+        .admin => role == .admin,
     };
 }
 
@@ -44,10 +60,19 @@ pub const Role = enum {
     admin,
 };
 
+pub const CreateUserParams = struct {
+    role: []const u8,
+    username: []const u8,
+    password: []const u8,
+};
+
 pub const LoginParams = struct {
     username: []const u8,
     password: []const u8,
 };
+
+pub const LoginResult = struct { token: []const u8, role: []const u8, expires_at_ms: i64 };
+pub const CreateUserResult = struct { username: []const u8, role: Role };
 
 pub const Options = struct {
     host: []const u8 = "127.0.0.1",

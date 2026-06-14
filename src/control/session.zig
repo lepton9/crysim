@@ -80,7 +80,8 @@ pub const ClientSession = struct {
 
     /// Make a request.
     pub fn request(self: *ClientSession, method: Method) !std.json.Parsed(protocol.Response) {
-        const token: ?[]const u8 = if (protocol.requireAuth(method))
+        const required_rights = protocol.requiredRights(method);
+        const token: ?[]const u8 = if (required_rights.auth)
             try self.requireToken()
         else
             null;
@@ -97,7 +98,8 @@ pub const ClientSession = struct {
         method: Method,
         params: anytype,
     ) !std.json.Parsed(protocol.Response) {
-        const token: ?[]const u8 = if (protocol.requireAuth(method))
+        const required_rights = protocol.requiredRights(method);
+        const token: ?[]const u8 = if (required_rights.auth)
             try self.requireToken()
         else
             null;

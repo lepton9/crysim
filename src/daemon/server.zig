@@ -15,6 +15,7 @@ pub const Server = struct {
     conn_group: std.Io.Group = .init,
 
     const User = struct {
+        username: []const u8,
         password: []const u8,
         role: protocol.Role,
     };
@@ -25,7 +26,7 @@ pub const Server = struct {
         expires_at: std.Io.Clock.Timestamp,
     };
 
-    const RequestError = enum {
+    const ErrorCode = enum {
         not_found,
         bad_request,
         internal,
@@ -48,8 +49,8 @@ pub const Server = struct {
 
     fn initUsers(self: *Server) !void {
         // TODO: Dev defaults. Load from file
-        try self.users.put(self.gpa, "admin", .{ .password = "admin", .role = .admin });
-        try self.users.put(self.gpa, "viewer", .{ .password = "viewer", .role = .viewer });
+        _ = try self.putUser(.admin, "admin", "admin");
+        _ = try self.putUser(.viewer, "viewer", "viewer");
     }
 
     pub fn deinit(self: *Server) void {
@@ -121,7 +122,7 @@ pub const Server = struct {
     }
 
     /// Write error response with error message.
-    fn sendErr(w: *std.Io.Writer, id: u64, code: RequestError, message: []const u8) void {
+    fn sendErr(w: *std.Io.Writer, id: u64, code: ErrorCode, message: []const u8) void {
         const Out = struct {
             id: u64,
             ok: bool = false,
@@ -142,16 +143,16 @@ pub const Server = struct {
     }
 
     /// Get the session matching the token or cleanup if expired.
-    fn requireSession(self: *Server, token: ?[]const u8) ?Session {
-        const t = token orelse return null;
-        const sess = self.sessions.get(t) orelse return null;
+    fn requireSession(self: *Server, token: ?[]const u8) !Session {
+        const t = token orelse return error.NotLoggedIn;
+        const sess = self.sessions.get(t) orelse return error.InvalidSessionToken;
         if (sess.expires_at.compare(.lte, nowBoot(self).withClock(.boot))) {
             // Cleanup of expired token
             if (self.sessions.fetchRemove(t)) |kv| {
                 self.gpa.free(kv.key);
                 self.gpa.free(kv.value.username);
             }
-            return null;
+            return error.TokenExpired;
         }
         return sess;
     }
@@ -192,40 +193,72 @@ pub const Server = struct {
         }
     }
 
+    fn getUser(self: *Server, username: []const u8) ?*User {
+        return self.users.getPtr(username);
+    }
+
+    /// Put a new user to the list of users.
+    fn putUser(
+        self: *Server,
+        role: protocol.Role,
+        username: []const u8,
+        password: []const u8,
+    ) error{ OutOfMemory, UserExists }!*User {
+        const gop = try self.users.getOrPut(self.gpa, username);
+        if (gop.found_existing) return error.UserExists;
+        const un = try self.gpa.dupe(u8, username);
+        gop.key_ptr.* = un;
+        gop.value_ptr.* = .{
+            .username = un,
+            .password = try self.gpa.dupe(u8, password),
+            .role = role,
+        };
+        return gop.value_ptr;
+    }
+
+    /// Check if the user is logged in and has enough rights.
+    ///
+    /// Skips check if the requested method does not require authentication.
     fn authenticate(self: *Server, req: protocol.Request) !?Session {
-        if (!protocol.requireAuth(req.method)) return null;
-        const sess = self.requireSession(req.token) orelse return error.Unauthorized;
+        const required_rights = protocol.requiredRights(req.method);
+        if (!required_rights.auth) return null;
+        const sess = try self.requireSession(req.token);
+        if (!protocol.hasEnoughRights(required_rights, sess.role))
+            return error.NotEnoughRights;
         return sess;
     }
 
-    const LoginError = error{
+    const RequestError = error{
         MissingParams,
         InvalidParams,
         InvalidCredentials,
+        InvalidRole,
+        InvalidPassword,
+        UserExists,
         OutOfMemory,
     };
 
-    /// Handle the login request and return the created token if succeeded.
-    fn login(self: *Server, req: protocol.Request) LoginError!struct {
-        token: []const u8,
-        role: []const u8,
-        expires_at_ms: i64,
-    } {
-        const params_val = req.params orelse return LoginError.MissingParams;
-        const params_parsed = std.json.parseFromValue(
-            protocol.LoginParams,
-            self.gpa,
-            params_val,
-            .{},
-        ) catch return LoginError.MissingParams;
+    /// Parse the params from the request.
+    fn parseParams(
+        T: type,
+        gpa: std.mem.Allocator,
+        req: protocol.Request,
+    ) RequestError!std.json.Parsed(T) {
+        const params_val = req.params orelse return RequestError.MissingParams;
+        return std.json.parseFromValue(T, gpa, params_val, .{}) catch
+            return RequestError.InvalidParams;
+    }
 
+    /// Handle the login request and return the created token if succeeded.
+    fn login(self: *Server, req: protocol.Request) RequestError!protocol.LoginResult {
+        const params_parsed = try parseParams(protocol.LoginParams, self.gpa, req);
         defer params_parsed.deinit();
         const params = params_parsed.value;
 
-        const user = self.users.get(params.username) orelse
-            return LoginError.InvalidCredentials;
+        const user = self.getUser(params.username) orelse
+            return RequestError.InvalidCredentials;
         if (!std.mem.eql(u8, user.password, params.password))
-            return LoginError.InvalidCredentials;
+            return RequestError.InvalidCredentials;
 
         var token_bytes: [32]u8 = undefined;
         var token_hex: [64]u8 = undefined;
@@ -250,11 +283,34 @@ pub const Server = struct {
         };
     }
 
+    /// Log the user out.
     fn logout(self: *Server, req: protocol.Request) error{NotLoggedIn}!void {
         const token = req.token orelse unreachable;
         const kv = self.sessions.fetchRemove(token) orelse return error.NotLoggedIn;
         self.gpa.free(kv.key);
         self.gpa.free(kv.value.username);
+    }
+
+    fn validatePassword(password: []const u8) ![]const u8 {
+        const trimmed = std.mem.trim(u8, password, " \t\n\r");
+        if (trimmed.len == 0) return RequestError.InvalidPassword;
+        return trimmed;
+    }
+
+    /// Create a new user.
+    ///
+    /// Checks that the creator has admin rights.
+    fn createUser(self: *Server, req: protocol.Request) RequestError!*User {
+        const params_parsed = try parseParams(protocol.CreateUserParams, self.gpa, req);
+        defer params_parsed.deinit();
+        const params = params_parsed.value;
+
+        if (self.getUser(params.username)) |_| return RequestError.UserExists;
+        const role = std.meta.stringToEnum(protocol.Role, params.role) orelse
+            return RequestError.InvalidRole;
+        const pw = try validatePassword(params.password);
+
+        return try self.putUser(role, params.username, pw);
     }
 
     /// Handle the incoming request.
@@ -264,8 +320,13 @@ pub const Server = struct {
                 "({s}), id={d}, error={s}",
                 .{ @tagName(req.method), req.id, @errorName(err) },
             );
-            sendErr(w, req.id, .unauthorized, "missing/invalid token");
-            return;
+            return switch (err) {
+                error.NotLoggedIn => sendErr(w, req.id, .unauthorized, "not logged in"),
+                error.InvalidSessionToken => sendErr(w, req.id, .unauthorized, "invalid token"),
+                error.TokenExpired => sendErr(w, req.id, .unauthorized, "sessiong token expired"),
+                error.NotEnoughRights => sendErr(w, req.id, .unauthorized, "not enough rights"),
+                else => unreachable,
+            };
         };
 
         if (sess) |s| {
@@ -282,19 +343,20 @@ pub const Server = struct {
             },
             .login => {
                 const res = self.login(req) catch |err| return switch (err) {
-                    LoginError.MissingParams => {
+                    RequestError.MissingParams => {
                         sendErr(w, req.id, .bad_request, "missing params");
                     },
-                    LoginError.InvalidParams => {
+                    RequestError.InvalidParams => {
                         sendErr(w, req.id, .bad_request, "invalid params");
                     },
-                    LoginError.InvalidCredentials => {
+                    RequestError.InvalidCredentials => {
                         sendErr(w, req.id, .unauthorized, "invalid credentials");
                     },
-                    LoginError.OutOfMemory => {
+                    RequestError.OutOfMemory => {
                         sendErr(w, req.id, .internal, "out of memory");
                         self.oom();
                     },
+                    else => unreachable,
                 };
                 self.log(
                     "Logged in user id={d}, role={s}, expires={d}",
@@ -308,6 +370,35 @@ pub const Server = struct {
                     return sendErr(w, req.id, .unauthorized, "not logged in");
                 };
                 return sendOk(w, req.id, .{ .message = "Logged out" });
+            },
+            .create_user => {
+                const user = self.createUser(req) catch |err| return switch (err) {
+                    RequestError.MissingParams => {
+                        sendErr(w, req.id, .bad_request, "missing params");
+                    },
+                    RequestError.InvalidParams => {
+                        sendErr(w, req.id, .bad_request, "invalid params");
+                    },
+                    RequestError.UserExists => {
+                        sendErr(w, req.id, .unauthorized, "user exists with the username");
+                    },
+                    RequestError.InvalidRole => {
+                        sendErr(w, req.id, .unauthorized, "invalid role");
+                    },
+                    RequestError.InvalidPassword => {
+                        sendErr(w, req.id, .unauthorized, "invalid password given");
+                    },
+                    RequestError.OutOfMemory => {
+                        sendErr(w, req.id, .internal, "out of memory");
+                        self.oom();
+                    },
+                    else => unreachable,
+                };
+                return sendOk(w, req.id, .{
+                    .message = "User created",
+                    .username = user.username,
+                    .role = @tagName(user.role),
+                });
             },
             .whoami => {
                 const session = sess orelse unreachable;

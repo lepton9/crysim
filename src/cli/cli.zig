@@ -48,6 +48,16 @@ const commands = &[_]zcli.Cmd{
         .{ .name = "password", .desc = "Password", .required = true },
     }, .action = cmdLogin },
     .{ .name = "logout", .desc = "Logout from the session", .action = cmdLogout },
+    .{
+        .name = "createuser",
+        .desc = "Create a new user",
+        .positionals = &[_]zcli.PosArg{
+            .{ .name = "role", .desc = "Role", .required = true },
+            .{ .name = "username", .desc = "Username", .required = true },
+            .{ .name = "password", .desc = "Password", .required = true },
+        },
+        .action = cmdCreateUser,
+    },
     .{ .name = "whoami", .desc = "Show current session", .action = cmdWhoAmI },
     .{ .name = "state", .desc = "Get current state", .action = cmdState },
 };
@@ -181,20 +191,17 @@ fn cmdLogin(ctxp: *anyopaque) anyerror!void {
     });
     defer resp.deinit();
 
-    if (!resp.value.ok) {
-        printJson(resp.value);
-        return;
-    }
-
-    const result_val = resp.value.result orelse {
+    const result = blk: {
+        const result_val = resp.value.result;
+        if (resp.value.ok) if (result_val) |r| break :blk r;
         printJson(resp.value);
         return;
     };
-    const LoginResult = struct { token: []const u8, role: []const u8, expires_at_ms: i64 };
+
     const parsed = try std.json.parseFromValue(
-        LoginResult,
+        protocol.LoginResult,
         ctx.init.gpa,
-        result_val,
+        result,
         .{ .ignore_unknown_fields = true },
     );
     defer parsed.deinit();
@@ -207,6 +214,38 @@ fn cmdLogout(ctxp: *anyopaque) anyerror!void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctxp));
     const resp = try ctx.sess.request(.logout);
     defer resp.deinit();
+    printJson(resp.value);
+}
+
+fn cmdCreateUser(ctxp: *anyopaque) anyerror!void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctxp));
+
+    const user_role = ctx.cli.findPositional("role") orelse unreachable;
+    const user_pos = ctx.cli.findPositional("username") orelse unreachable;
+    const pass_pos = ctx.cli.findPositional("password") orelse unreachable;
+
+    const resp = try ctx.sess.requestParams(.create_user, protocol.CreateUserParams{
+        .role = user_role.value,
+        .username = user_pos.value,
+        .password = pass_pos.value,
+    });
+    defer resp.deinit();
+
+    const result = blk: {
+        const result_val = resp.value.result;
+        if (resp.value.ok) if (result_val) |r| break :blk r;
+        printJson(resp.value);
+        return;
+    };
+
+    const parsed = try std.json.parseFromValue(
+        protocol.CreateUserResult,
+        ctx.init.gpa,
+        result,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+
     printJson(resp.value);
 }
 
