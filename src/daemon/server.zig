@@ -1,5 +1,9 @@
 const std = @import("std");
+const argon2 = std.crypto.pwhash.argon2;
 const protocol = @import("crysim").protocol;
+const db = @import("db.zig");
+
+const Db = db.Db;
 
 pub const Server = struct {
     io: std.Io,
@@ -9,7 +13,9 @@ pub const Server = struct {
     running: std.atomic.Value(bool) = .init(false),
     start_ts: std.Io.Timestamp,
 
-    users: std.StringHashMapUnmanaged(User) = .{},
+    db: Db,
+
+    users: std.StringHashMapUnmanaged(Db.User) = .{},
     sessions: std.StringHashMapUnmanaged(Session) = .{},
 
     /// Group for the server loops.
@@ -19,12 +25,6 @@ pub const Server = struct {
 
     const SESSION_LEN_S = 12 * 60 * 60;
     const CLEANUP_FREQUENCY_S = 5;
-
-    const User = struct {
-        username: []const u8,
-        password: []const u8,
-        role: protocol.Role,
-    };
 
     const Session = struct {
         username: []const u8,
@@ -39,7 +39,12 @@ pub const Server = struct {
         unauthorized,
     };
 
-    pub fn init(io: std.Io, gpa: std.mem.Allocator, addr: std.Io.net.IpAddress) !*Server {
+    pub fn init(
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        addr: std.Io.net.IpAddress,
+        db_path: []const u8,
+    ) !*Server {
         const s = try gpa.create(Server);
         errdefer gpa.destroy(s);
         s.* = .{
@@ -48,16 +53,13 @@ pub const Server = struct {
             .listen_addr = addr,
             .server = try addr.listen(io, .{ .reuse_address = true }),
             .start_ts = std.Io.Clock.boot.now(io),
+            .db = try db.Db.init(gpa, db_path),
         };
-        try s.initUsers();
+        errdefer s.db.deinit();
         s.running.store(true, .seq_cst);
-        return s;
-    }
 
-    fn initUsers(self: *Server) !void {
-        // TODO: Dev defaults. Load from file
-        _ = try self.putUser(.admin, "admin", "admin");
-        _ = try self.putUser(.viewer, "viewer", "viewer");
+        // _ = try s.createUserInner("admin", "admin", "admin");
+        return s;
     }
 
     pub fn deinit(self: *Server) void {
@@ -73,9 +75,11 @@ pub const Server = struct {
         var uit = self.users.iterator();
         while (uit.next()) |e| {
             self.gpa.free(e.key_ptr.*);
-            self.gpa.free(e.value_ptr.password);
+            self.gpa.free(e.value_ptr.password_hash);
         }
         self.users.deinit(self.gpa);
+
+        self.db.deinit();
         self.server.deinit(self.io);
         self.gpa.destroy(self);
     }
@@ -233,8 +237,29 @@ pub const Server = struct {
         }
     }
 
-    fn getUser(self: *Server, username: []const u8) ?*User {
-        return self.users.getPtr(username);
+    /// Fetch a user from the in-memory cache or lazily load from SQLite.
+    fn getUser(self: *Server, username: []const u8) error{ OutOfMemory, DbError }!?*Db.User {
+        if (self.users.getPtr(username)) |u| return u;
+
+        const owned_opt = self.db.getUserOwned(self.gpa, username) catch |err| {
+            self.logErr("DB get user failed: {s}", .{@errorName(err)});
+            return error.DbError;
+        };
+        const owned = owned_opt orelse return null;
+        errdefer {
+            self.gpa.free(owned.username);
+            self.gpa.free(owned.password_hash);
+        }
+
+        const inserted = self.putUserOwned(
+            owned.role,
+            owned.username,
+            owned.password_hash,
+        ) catch |err| switch (err) {
+            error.UserExists => return self.users.getPtr(username),
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        return inserted;
     }
 
     /// Put a new user to the list of users.
@@ -243,14 +268,32 @@ pub const Server = struct {
         role: protocol.Role,
         username: []const u8,
         password: []const u8,
-    ) error{ OutOfMemory, UserExists }!*User {
+    ) error{ OutOfMemory, UserExists }!*Db.User {
         const gop = try self.users.getOrPut(self.gpa, username);
         if (gop.found_existing) return error.UserExists;
         const un = try self.gpa.dupe(u8, username);
         gop.key_ptr.* = un;
         gop.value_ptr.* = .{
             .username = un,
-            .password = try self.gpa.dupe(u8, password),
+            .password_hash = try self.gpa.dupe(u8, password),
+            .role = role,
+        };
+        return gop.value_ptr;
+    }
+
+    /// Put a new user to the list of users, taking ownership of the buffers.
+    fn putUserOwned(
+        self: *Server,
+        role: protocol.Role,
+        username: []u8,
+        password_hash: []u8,
+    ) error{ OutOfMemory, UserExists }!*Db.User {
+        const gop = try self.users.getOrPut(self.gpa, username);
+        if (gop.found_existing) return error.UserExists;
+        gop.key_ptr.* = username;
+        gop.value_ptr.* = .{
+            .username = username,
+            .password_hash = password_hash,
             .role = role,
         };
         return gop.value_ptr;
@@ -327,6 +370,7 @@ pub const Server = struct {
         InvalidRole,
         InvalidPassword,
         UserExists,
+        DbError,
         OutOfMemory,
     };
 
@@ -347,9 +391,13 @@ pub const Server = struct {
         defer params_parsed.deinit();
         const params = params_parsed.value;
 
-        const user = self.getUser(params.username) orelse
-            return RequestError.InvalidCredentials;
-        if (!std.mem.eql(u8, user.password, params.password))
+        const user = self.getUser(params.username) catch |err| switch (err) {
+            error.OutOfMemory => return RequestError.OutOfMemory,
+            error.DbError => return RequestError.DbError,
+        } orelse return RequestError.InvalidCredentials;
+
+        const ok = try self.verifyPassword(user.password_hash, params.password);
+        if (!ok)
             return RequestError.InvalidCredentials;
 
         var token_bytes: [32]u8 = undefined;
@@ -390,20 +438,90 @@ pub const Server = struct {
         return trimmed;
     }
 
-    /// Create a new user.
-    ///
-    /// Checks that the creator has admin rights.
-    fn createUser(self: *Server, req: protocol.Request) RequestError!*User {
+    /// Create hash for the given password.
+    fn hashPassword(self: *Server, password: []const u8) RequestError![]u8 {
+        var buf: [256]u8 = undefined;
+        const hashed = argon2.strHash(password, .{
+            .allocator = self.gpa,
+            .params = argon2.Params.owasp_2id,
+            .mode = .argon2id,
+            .encoding = .phc,
+        }, &buf, self.io) catch |err| switch (err) {
+            error.OutOfMemory => return RequestError.OutOfMemory,
+            else => {
+                self.logErr("password hash failed: {s}", .{@errorName(err)});
+                return RequestError.DbError;
+            },
+        };
+
+        return self.gpa.dupe(u8, hashed) catch return RequestError.OutOfMemory;
+    }
+
+    /// Check the password against the given hash.
+    fn verifyPassword(
+        self: *Server,
+        stored_hash: []const u8,
+        password: []const u8,
+    ) RequestError!bool {
+        argon2.strVerify(
+            stored_hash,
+            password,
+            .{ .allocator = self.gpa },
+            self.io,
+        ) catch |err| switch (err) {
+            error.PasswordVerificationFailed => return false,
+            error.InvalidEncoding => return false,
+            error.OutOfMemory => return RequestError.OutOfMemory,
+            else => {
+                self.logErr("password verify failed: {s}", .{@errorName(err)});
+                return RequestError.DbError;
+            },
+        };
+        return true;
+    }
+
+    /// Handle create user request.
+    fn createUser(self: *Server, req: protocol.Request) RequestError!*Db.User {
         const params_parsed = try parseParams(protocol.CreateUserParams, self.gpa, req);
         defer params_parsed.deinit();
         const params = params_parsed.value;
+        return self.createUserInner(params.role, params.username, params.password);
+    }
 
-        if (self.getUser(params.username)) |_| return RequestError.UserExists;
-        const role = std.meta.stringToEnum(protocol.Role, params.role) orelse
+    /// Create a new user.
+    ///
+    /// Checks that the creator has admin rights.
+    fn createUserInner(
+        self: *Server,
+        role_str: []const u8,
+        username: []const u8,
+        password: []const u8,
+    ) RequestError!*Db.User {
+        if (self.getUser(username) catch |err| switch (err) {
+            error.OutOfMemory => return RequestError.OutOfMemory,
+            error.DbError => return RequestError.DbError,
+        }) |_| return RequestError.UserExists;
+        const role = std.meta.stringToEnum(protocol.Role, role_str) orelse
             return RequestError.InvalidRole;
-        const pw = try validatePassword(params.password);
+        const pw = try validatePassword(password);
 
-        return try self.putUser(role, params.username, pw);
+        const pw_hash = try self.hashPassword(pw);
+        errdefer self.gpa.free(pw_hash);
+
+        const now_ms: i64 = std.Io.Clock.real.now(self.io).toMilliseconds();
+        self.db.insertUser(role, username, pw_hash, now_ms) catch |err| {
+            if (err == error.ConstraintUnique) return RequestError.UserExists;
+            self.logErr("DB insert user failed: {s}", .{@errorName(err)});
+            return RequestError.DbError;
+        };
+
+        const username_alloc = try self.gpa.dupe(u8, username);
+        errdefer self.gpa.free(username_alloc);
+
+        return self.putUserOwned(role, username_alloc, pw_hash) catch |err| switch (err) {
+            error.UserExists => return RequestError.UserExists,
+            error.OutOfMemory => return RequestError.OutOfMemory,
+        };
     }
 
     /// Handle the incoming request.
@@ -494,6 +612,9 @@ pub const Server = struct {
                     },
                     RequestError.InvalidPassword => {
                         sendErr(w, req.id, .unauthorized, "invalid password given");
+                    },
+                    RequestError.DbError => {
+                        sendErr(w, req.id, .internal, "db error");
                     },
                     RequestError.OutOfMemory => {
                         sendErr(w, req.id, .internal, "out of memory");

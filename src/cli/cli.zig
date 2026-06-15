@@ -5,10 +5,9 @@ const options = @import("build_options");
 const crysim = @import("crysim");
 const protocol = crysim.protocol;
 const session = crysim.session;
+const data = crysim.data;
 
 const Method = protocol.Method;
-
-const DATA_PATH = ".local/share/crysim";
 
 const spec: zcli.CliApp = .{
     .config = .{
@@ -72,12 +71,13 @@ const Ctx = struct {
 
 const CliTokenStore = struct {
     io: std.Io,
+    gpa: std.mem.Allocator,
     env: *std.process.Environ.Map,
     token: ?[]const u8 = null,
 
     fn tokenFilePath(self: *const CliTokenStore, gpa: std.mem.Allocator) ![]u8 {
-        const home = self.env.get("HOME") orelse return error.NoHome;
-        return std.Io.Dir.path.join(gpa, &.{ home, DATA_PATH, "token" });
+        return (try data.dataFilePath(self.io, gpa, self.env, "client", "token")) orelse
+            return error.NoHome;
     }
 
     fn load(ctxp: *anyopaque, gpa: std.mem.Allocator) anyerror!?[]u8 {
@@ -106,16 +106,11 @@ const CliTokenStore = struct {
 
     fn save(ctxp: *anyopaque, token: []const u8) anyerror!void {
         const self: *CliTokenStore = @ptrCast(@alignCast(ctxp));
-        const home = self.env.get("HOME") orelse return error.NoHome;
 
-        var home_dir = try std.Io.Dir.openDirAbsolute(self.io, home, .{});
-        defer home_dir.close(self.io);
+        const path = try self.tokenFilePath(self.gpa);
+        defer self.gpa.free(path);
 
-        try home_dir.createDirPath(self.io, DATA_PATH);
-        var cdir = try home_dir.openDir(self.io, DATA_PATH, .{});
-        defer cdir.close(self.io);
-
-        var file = try cdir.createFile(self.io, "token", .{ .truncate = true });
+        var file = try std.Io.Dir.createFileAbsolute(self.io, path, .{ .truncate = true });
         defer file.close(self.io);
 
         var wbuf: [256]u8 = undefined;
@@ -134,6 +129,7 @@ pub fn handleCli(init: std.process.Init) !void {
 
     var store = CliTokenStore{
         .io = init.io,
+        .gpa = init.gpa,
         .env = init.environ_map,
         .token = if (cli.findOption("token")) |t| t.value.?.string else null,
     };

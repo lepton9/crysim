@@ -37,16 +37,25 @@ pub fn setupDaemon(
     optimize: std.builtin.OptimizeMode,
     crysim_mod: *std.Build.Module,
 ) *std.Build.Step.Compile {
+    const zqlite = b.lazyDependency("zqlite", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "crysimd",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/daemon/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{},
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "crysim", .module = crysim_mod },
+            },
         }),
     });
-    exe.root_module.addImport("crysim", crysim_mod);
+    if (zqlite) |m| exe.root_module.addImport("zqlite", m.module("zqlite"));
+
     b.installArtifact(exe);
     return exe;
 }
@@ -72,10 +81,11 @@ pub fn setupClientCli(
             .root_source_file = b.path("src/cli/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{},
+            .imports = &.{
+                .{ .name = "crysim", .module = crysim_mod },
+            },
         }),
     });
-    exe.root_module.addImport("crysim", crysim_mod);
     if (zcli) |m| exe.root_module.addImport("zcli", m.module("zcli"));
     exe.root_module.addOptions("build_options", options);
 
