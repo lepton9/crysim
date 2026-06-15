@@ -47,6 +47,15 @@ const commands = &[_]zcli.Cmd{
         .{ .name = "password", .desc = "Password", .required = true },
     }, .action = cmdLogin },
     .{ .name = "logout", .desc = "Logout from the session", .action = cmdLogout },
+    .{
+        .name = "changepw",
+        .desc = "Change password",
+        .action = cmdChangePassword,
+        .positionals = &[_]zcli.PosArg{
+            .{ .name = "old", .desc = "Old password", .required = true },
+            .{ .name = "new", .desc = "New password", .required = true },
+        },
+    },
     .{ .name = "whoami", .desc = "Show current session", .action = cmdWhoAmI },
     .{ .name = "state", .desc = "Get current state", .action = cmdState },
     .{
@@ -244,6 +253,18 @@ fn cmdCreateUser(ctxp: *anyopaque) anyerror!void {
     );
     defer parsed.deinit();
 
+    printJson(resp.value);
+}
+
+fn cmdChangePassword(ctxp: *anyopaque) anyerror!void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctxp));
+    const old = ctx.cli.findPositional("old") orelse unreachable;
+    const new = ctx.cli.findPositional("new") orelse unreachable;
+    const resp = try ctx.sess.requestParams(.change_password, .{
+        .old = old.value,
+        .new = new.value,
+    });
+    defer resp.deinit();
     printJson(resp.value);
 }
 

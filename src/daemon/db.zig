@@ -58,24 +58,23 @@ pub const Db = struct {
     }
 
     pub fn getUserOwned(self: *Db, gpa: std.mem.Allocator, username: []const u8) !?User {
-        if (try self.conn.row(
+        const row = try self.conn.row(
             "select username, password_hash, role from users where username = ?1 limit 1",
             .{username},
-        )) |row| {
-            defer row.deinit();
+        ) orelse return null;
 
-            const un_txt = row.text(0);
-            const pw_txt = row.text(1);
-            const role_txt = row.text(2);
-            const role = std.meta.stringToEnum(protocol.Role, role_txt) orelse
-                return error.InvalidRole;
+        defer row.deinit();
 
-            return .{
-                .username = try gpa.dupe(u8, un_txt),
-                .password_hash = try gpa.dupe(u8, pw_txt),
-                .role = role,
-            };
-        }
-        return null;
+        const un_txt = row.text(0);
+        const pw_txt = row.text(1);
+        const role_txt = row.text(2);
+        const role = std.meta.stringToEnum(protocol.Role, role_txt) orelse
+            return error.InvalidRole;
+
+        return .{
+            .username = try gpa.dupe(u8, un_txt),
+            .password_hash = try gpa.dupe(u8, pw_txt),
+            .role = role,
+        };
     }
 };

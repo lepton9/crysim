@@ -369,6 +369,7 @@ pub const Server = struct {
         InvalidCredentials,
         InvalidRole,
         InvalidPassword,
+        UserDoesNotExist,
         UserExists,
         DbError,
         OutOfMemory,
@@ -397,8 +398,7 @@ pub const Server = struct {
         } orelse return RequestError.InvalidCredentials;
 
         const ok = try self.verifyPassword(user.password_hash, params.password);
-        if (!ok)
-            return RequestError.InvalidCredentials;
+        if (!ok) return RequestError.InvalidCredentials;
 
         var token_bytes: [32]u8 = undefined;
         var token_hex: [64]u8 = undefined;
@@ -432,13 +432,43 @@ pub const Server = struct {
         self.gpa.free(kv.value.username);
     }
 
+    /// Change the password of the user making the request.
+    fn changePassword(
+        self: *Server,
+        req: protocol.Request,
+        session: *const Session,
+    ) RequestError!void {
+        const params_parsed = try parseParams(
+            struct { old: []const u8, new: []const u8 },
+            self.gpa,
+            req,
+        );
+        defer params_parsed.deinit();
+        const params = params_parsed.value;
+
+        const user = try self.getUser(session.username) orelse
+            return RequestError.UserDoesNotExist;
+
+        const ok = try self.verifyPassword(user.password_hash, params.old);
+        if (!ok) return RequestError.InvalidPassword;
+
+        const new = try validatePassword(params.new);
+        const new_hash = try self.hashPassword(new);
+        errdefer self.gpa.free(new_hash);
+
+        self.db.updateUserPasswordHash(session.username, new_hash) catch
+            return RequestError.DbError;
+        self.gpa.free(user.password_hash);
+        user.password_hash = new_hash;
+    }
+
     fn validatePassword(password: []const u8) ![]const u8 {
         const trimmed = std.mem.trim(u8, password, " \t\n\r");
         if (trimmed.len == 0) return RequestError.InvalidPassword;
         return trimmed;
     }
 
-    /// Create hash for the given password.
+    /// Create and allocate hash for the given password.
     fn hashPassword(self: *Server, password: []const u8) RequestError![]u8 {
         var buf: [256]u8 = undefined;
         const hashed = argon2.strHash(password, .{
@@ -453,7 +483,6 @@ pub const Server = struct {
                 return RequestError.DbError;
             },
         };
-
         return self.gpa.dupe(u8, hashed) catch return RequestError.OutOfMemory;
     }
 
@@ -563,6 +592,9 @@ pub const Server = struct {
                     RequestError.InvalidCredentials => {
                         sendErr(w, req.id, .unauthorized, "invalid credentials");
                     },
+                    RequestError.DbError => {
+                        sendErr(w, req.id, .internal, "db error");
+                    },
                     RequestError.OutOfMemory => {
                         sendErr(w, req.id, .internal, "out of memory");
                         self.oom();
@@ -581,6 +613,33 @@ pub const Server = struct {
                     return sendErr(w, req.id, .unauthorized, "not logged in");
                 };
                 return sendOk(w, req.id, .{ .message = "Logged out" });
+            },
+            .change_password => {
+                const session = sess orelse unreachable;
+                self.changePassword(req, &session) catch |err| switch (err) {
+                    RequestError.MissingParams => {
+                        sendErr(w, req.id, .bad_request, "missing params");
+                    },
+                    RequestError.InvalidParams => {
+                        sendErr(w, req.id, .bad_request, "invalid params");
+                    },
+                    RequestError.InvalidPassword => {
+                        sendErr(w, req.id, .unauthorized, "invalid password");
+                    },
+                    RequestError.UserDoesNotExist => {
+                        sendErr(w, req.id, .internal, "user does not exist");
+                    },
+                    RequestError.DbError => {
+                        sendErr(w, req.id, .internal, "db error");
+                    },
+                    RequestError.OutOfMemory => {
+                        sendErr(w, req.id, .internal, "out of memory");
+                        self.oom();
+                    },
+                    else => unreachable,
+                };
+
+                return sendOk(w, req.id, .{ .message = "Password changed" });
             },
             .whoami => {
                 const session = sess orelse unreachable;
