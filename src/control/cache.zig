@@ -48,10 +48,10 @@ pub fn OwnedStringCache(comptime V: type) type {
             prune_per_set: usize = 1,
         };
 
-        pub fn init(allocator: std.mem.Allocator, io: std.Io, opts: Options) Self {
+        pub fn init(io: std.Io, allocator: std.mem.Allocator, opts: Options) Self {
             return .{
-                .allocator = allocator,
                 .io = io,
+                .allocator = allocator,
                 .ttl_ms = opts.ttl_ms,
                 .max_entries = opts.max_entries,
                 .prune_per_set = opts.prune_per_set,
