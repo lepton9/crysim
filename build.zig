@@ -27,8 +27,8 @@ pub fn build(b: *std.Build) void {
 
     // Check step
     const check_step = b.step("check", "Check for compilation errors");
-    check_step.dependOn(&run_cli_cmd.step);
-    check_step.dependOn(&run_daemon_cmd.step);
+    check_step.dependOn(&exe_cli.step);
+    check_step.dependOn(&exe_daemon.step);
 }
 
 pub fn setupDaemon(

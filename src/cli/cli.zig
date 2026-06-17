@@ -59,6 +59,38 @@ const commands = &[_]zcli.Cmd{
     .{ .name = "whoami", .desc = "Show current session", .action = cmdWhoAmI },
     .{ .name = "state", .desc = "Get current state", .action = cmdState },
     .{
+        .name = "price",
+        .desc = "Get spot USD price",
+        .positionals = &[_]zcli.PosArg{.{ .name = "asset", .desc = "Asset symbol (BTC/ETH)", .required = true }},
+        .action = cmdPrice,
+    },
+    .{
+        .name = "buy",
+        .desc = "Buy an asset with USD",
+        .positionals = &[_]zcli.PosArg{
+            .{ .name = "asset", .desc = "Asset symbol (BTC/ETH)", .required = true },
+            .{ .name = "usd", .desc = "USD amount", .required = true },
+        },
+        .action = cmdBuy,
+    },
+    .{
+        .name = "sell",
+        .desc = "Sell an asset for USD",
+        .positionals = &[_]zcli.PosArg{
+            .{ .name = "asset", .desc = "Asset symbol (BTC/ETH)", .required = true },
+            .{ .name = "qty", .desc = "Asset quantity", .required = true },
+        },
+        .action = cmdSell,
+    },
+    .{
+        .name = "history",
+        .desc = "Trade history (optionally filter by asset)",
+        .positionals = &[_]zcli.PosArg{
+            .{ .name = "asset", .desc = "Asset symbol (BTC/ETH)", .required = false },
+        },
+        .action = cmdHistory,
+    },
+    .{
         .name = "createuser",
         .desc = "Create a new user",
         .positionals = &[_]zcli.PosArg{
@@ -253,6 +285,58 @@ fn cmdCreateUser(ctxp: *anyopaque) anyerror!void {
     );
     defer parsed.deinit();
 
+    printJson(resp.value);
+}
+
+fn cmdPrice(ctxp: *anyopaque) anyerror!void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctxp));
+    const asset_pos = ctx.cli.findPositional("asset") orelse unreachable;
+    const resp = try ctx.sess.requestParams(.price, protocol.PriceParams{
+        .asset = asset_pos.value,
+    });
+    defer resp.deinit();
+    printJson(resp.value);
+}
+
+fn cmdBuy(ctxp: *anyopaque) anyerror!void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctxp));
+    const asset_pos = ctx.cli.findPositional("asset") orelse unreachable;
+    const usd_pos = ctx.cli.findPositional("usd") orelse unreachable;
+
+    const resp = try ctx.sess.requestParams(.buy, protocol.BuyParams{
+        .asset = asset_pos.value,
+        .usd = usd_pos.value,
+    });
+    defer resp.deinit();
+    printJson(resp.value);
+}
+
+fn cmdSell(ctxp: *anyopaque) anyerror!void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctxp));
+    const asset_pos = ctx.cli.findPositional("asset") orelse unreachable;
+    const qty_pos = ctx.cli.findPositional("qty") orelse unreachable;
+
+    const resp = try ctx.sess.requestParams(.sell, protocol.SellParams{
+        .asset = asset_pos.value,
+        .qty = qty_pos.value,
+    });
+    defer resp.deinit();
+    printJson(resp.value);
+}
+
+fn cmdHistory(ctxp: *anyopaque) anyerror!void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctxp));
+
+    const asset_pos = ctx.cli.findPositional("asset");
+    const asset_opt: ?[]const u8 = blk: {
+        const p = asset_pos orelse break :blk null;
+        break :blk if (p.value.len == 0) null else p.value;
+    };
+
+    const resp = try ctx.sess.requestParams(.trade_history, protocol.TradeHistoryParams{
+        .asset = asset_opt,
+    });
+    defer resp.deinit();
     printJson(resp.value);
 }
 
