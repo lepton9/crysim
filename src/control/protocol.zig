@@ -88,6 +88,52 @@ pub const LoginParams = struct {
 pub const LoginResult = struct { token: []const u8, role: []const u8, expires_at_ms: i64 };
 pub const CreateUserResult = struct { username: []const u8, role: Role };
 
+pub const PriceParams = struct { asset: []const u8 };
+pub const PriceResult = struct { asset: []const u8, price_usd: []const u8, ts_ms: i64 };
+
+pub const BuyParams = struct { asset: []const u8, usd: []const u8 };
+pub const SellParams = struct { asset: []const u8, qty: []const u8 };
+
+pub const TradeHistoryParams = struct {
+    asset: ?[]const u8 = null,
+    limit: ?u32 = null,
+    offset: ?u32 = null,
+};
+
+pub const TradeRow = struct {
+    id: i64,
+    ts_ms: i64,
+    side: []const u8,
+    asset: []const u8,
+    qty: []const u8,
+    price_usd: []const u8,
+    usd_gross: []const u8,
+    fee_usd: []const u8,
+    usd_net: []const u8,
+};
+
+pub const TradeResult = TradeRow;
+
+pub const BalanceRow = struct { asset: []const u8, amount: []const u8 };
+
+pub const AssetState = struct {
+    asset: []const u8,
+    qty: []const u8,
+    cost_basis_usd: []const u8,
+    spot_price_usd: []const u8,
+    market_value_usd: []const u8,
+    unrealized_pnl_usd: []const u8,
+};
+
+pub const StateResult = struct {
+    balances: []const BalanceRow,
+    equity_usd: []const u8,
+    net_deposits_usd: []const u8,
+    pnl_usd: []const u8,
+    fees_paid_usd: []const u8,
+    assets: []const AssetState,
+};
+
 pub const Options = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 5555,

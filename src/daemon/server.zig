@@ -2,6 +2,9 @@ const std = @import("std");
 const argon2 = std.crypto.pwhash.argon2;
 const protocol = @import("crysim").protocol;
 const db = @import("db.zig");
+const prices = @import("prices.zig");
+const trading = @import("trading.zig");
+const wiring = @import("wiring.zig");
 
 const Db = db.Db;
 
@@ -14,6 +17,7 @@ pub const Server = struct {
     start_ts: std.Io.Timestamp,
 
     db: Db,
+    trading_service: trading.TradingService = undefined,
 
     users: std.StringHashMapUnmanaged(Db.User) = .{},
     sessions: std.StringHashMapUnmanaged(Session) = .{},
@@ -24,9 +28,12 @@ pub const Server = struct {
     conn_group: std.Io.Group = .init,
 
     const SESSION_LEN_S = 12 * 60 * 60;
-    const CLEANUP_FREQUENCY_S = 5;
+    const CLEANUP_FREQUENCY_S = 60;
+
+    const STARTING_USD_CENTS: i64 = 1_000_000; // $10,000.00
 
     const Session = struct {
+        user_id: i64,
         username: []const u8,
         role: protocol.Role,
         expires_at: std.Io.Clock.Timestamp,
@@ -37,6 +44,8 @@ pub const Server = struct {
         bad_request,
         internal,
         unauthorized,
+        forbidden,
+        conflict,
     };
 
     pub fn init(
@@ -54,11 +63,13 @@ pub const Server = struct {
             .server = try addr.listen(io, .{ .reuse_address = true }),
             .start_ts = std.Io.Clock.boot.now(io),
             .db = try db.Db.init(gpa, db_path),
+            .trading_service = try wiring.createTradingService(io, gpa, &s.db, .sim),
         };
         errdefer s.db.deinit();
         s.running.store(true, .seq_cst);
 
-        // _ = try s.createUserInner("admin", "admin", "admin");
+        s.initDevEnv();
+
         return s;
     }
 
@@ -79,9 +90,17 @@ pub const Server = struct {
         }
         self.users.deinit(self.gpa);
 
+        self.trading_service.deinit();
         self.db.deinit();
         self.server.deinit(self.io);
         self.gpa.destroy(self);
+    }
+
+    /// TODO: only for testing
+    fn initDevEnv(self: *Server) void {
+        _ = self.createUserInner("admin", "admin", "admin") catch {};
+        _ = self.createUserInner("trader", "trader", "trader") catch {};
+        _ = self.createUserInner("viewer", "viewer", "viewer") catch {};
     }
 
     pub fn run(self: *Server) void {
@@ -148,34 +167,6 @@ pub const Server = struct {
         return std.Io.Clock.boot.now(self.io);
     }
 
-    /// Write ok response with the result content.
-    fn sendOk(w: *std.Io.Writer, id: u64, result: anytype) void {
-        const Out = struct {
-            id: u64,
-            ok: bool = true,
-            result: @TypeOf(result),
-        };
-        std.json.Stringify.value(Out{ .id = id, .result = result }, .{}, w) catch return;
-        w.writeAll("\n") catch return;
-        w.flush() catch return;
-    }
-
-    /// Write error response with error message.
-    fn sendErr(w: *std.Io.Writer, id: u64, code: ErrorCode, message: []const u8) void {
-        const Out = struct {
-            id: u64,
-            ok: bool = false,
-            @"error": protocol.Error,
-        };
-        std.json.Stringify.value(
-            Out{ .id = id, .@"error" = .{ .code = @tagName(code), .message = message } },
-            .{},
-            w,
-        ) catch return;
-        w.writeAll("\n") catch return;
-        w.flush() catch return;
-    }
-
     fn newTokenHex(io: std.Io, buf: *[32]u8, out_hex: *[64]u8) void {
         std.Io.randomSecure(io, buf) catch std.Io.random(io, buf);
         out_hex.* = std.fmt.bytesToHex(buf.*, .lower);
@@ -233,7 +224,7 @@ pub const Server = struct {
                 continue;
             };
 
-            self.dispatch(parsed.value, &writer.interface);
+            self.dispatch(arena, parsed.value, &writer.interface);
         }
     }
 
@@ -253,6 +244,7 @@ pub const Server = struct {
 
         const inserted = self.putUserOwned(
             owned.role,
+            owned.id,
             owned.username,
             owned.password_hash,
         ) catch |err| switch (err) {
@@ -266,6 +258,7 @@ pub const Server = struct {
     fn putUser(
         self: *Server,
         role: protocol.Role,
+        user_id: i64,
         username: []const u8,
         password: []const u8,
     ) error{ OutOfMemory, UserExists }!*Db.User {
@@ -274,6 +267,7 @@ pub const Server = struct {
         const un = try self.gpa.dupe(u8, username);
         gop.key_ptr.* = un;
         gop.value_ptr.* = .{
+            .id = user_id,
             .username = un,
             .password_hash = try self.gpa.dupe(u8, password),
             .role = role,
@@ -285,6 +279,7 @@ pub const Server = struct {
     fn putUserOwned(
         self: *Server,
         role: protocol.Role,
+        user_id: i64,
         username: []u8,
         password_hash: []u8,
     ) error{ OutOfMemory, UserExists }!*Db.User {
@@ -292,6 +287,7 @@ pub const Server = struct {
         if (gop.found_existing) return error.UserExists;
         gop.key_ptr.* = username;
         gop.value_ptr.* = .{
+            .id = user_id,
             .username = username,
             .password_hash = password_hash,
             .role = role,
@@ -377,7 +373,7 @@ pub const Server = struct {
 
     /// Parse the params from the request.
     fn parseParams(
-        T: type,
+        comptime T: type,
         gpa: std.mem.Allocator,
         req: protocol.Request,
     ) RequestError!std.json.Parsed(T) {
@@ -413,6 +409,7 @@ pub const Server = struct {
         const expires_at = now_ts.addDuration(std.Io.Duration.fromSeconds(SESSION_LEN_S));
         self.revokeSessionsUsername(username) catch {};
         try self.sessions.put(self.gpa, token, .{
+            .user_id = user.id,
             .username = username,
             .role = user.role,
             .expires_at = expires_at.withClock(.boot),
@@ -456,7 +453,7 @@ pub const Server = struct {
         const new_hash = try self.hashPassword(new);
         errdefer self.gpa.free(new_hash);
 
-        self.db.updateUserPasswordHash(session.username, new_hash) catch
+        self.db.updateUserPasswordHash(session.user_id, new_hash) catch
             return RequestError.DbError;
         self.gpa.free(user.password_hash);
         user.password_hash = new_hash;
@@ -538,7 +535,13 @@ pub const Server = struct {
         errdefer self.gpa.free(pw_hash);
 
         const now_ms: i64 = std.Io.Clock.real.now(self.io).toMilliseconds();
-        self.db.insertUser(role, username, pw_hash, now_ms) catch |err| {
+        const user_id = self.db.insertUserWithInitialCredit(
+            role,
+            username,
+            pw_hash,
+            now_ms,
+            STARTING_USD_CENTS,
+        ) catch |err| {
             if (err == error.ConstraintUnique) return RequestError.UserExists;
             self.logErr("DB insert user failed: {s}", .{@errorName(err)});
             return RequestError.DbError;
@@ -547,14 +550,14 @@ pub const Server = struct {
         const username_alloc = try self.gpa.dupe(u8, username);
         errdefer self.gpa.free(username_alloc);
 
-        return self.putUserOwned(role, username_alloc, pw_hash) catch |err| switch (err) {
+        return self.putUserOwned(role, user_id, username_alloc, pw_hash) catch |err| switch (err) {
             error.UserExists => return RequestError.UserExists,
             error.OutOfMemory => return RequestError.OutOfMemory,
         };
     }
 
     /// Handle the incoming request.
-    fn dispatch(self: *Server, req: protocol.Request, w: *std.Io.Writer) void {
+    fn dispatch(self: *Server, alloc: std.mem.Allocator, req: protocol.Request, w: *std.Io.Writer) void {
         const sess = self.authenticate(req) catch |err| {
             self.logErr(
                 "({s}), id={d}, error={s}",
@@ -563,8 +566,8 @@ pub const Server = struct {
             return switch (err) {
                 error.NotLoggedIn => sendErr(w, req.id, .unauthorized, "not logged in"),
                 error.InvalidSessionToken => sendErr(w, req.id, .unauthorized, "invalid token"),
-                error.TokenExpired => sendErr(w, req.id, .unauthorized, "sessiong token expired"),
-                error.NotEnoughRights => sendErr(w, req.id, .unauthorized, "not enough rights"),
+                error.TokenExpired => sendErr(w, req.id, .unauthorized, "session token expired"),
+                error.NotEnoughRights => sendErr(w, req.id, .forbidden, "not enough rights"),
                 else => unreachable,
             };
         };
@@ -582,24 +585,8 @@ pub const Server = struct {
                 return sendOk(w, req.id, .{ .uptime_ms = uptime_ms });
             },
             .login => {
-                const res = self.login(req) catch |err| return switch (err) {
-                    RequestError.MissingParams => {
-                        sendErr(w, req.id, .bad_request, "missing params");
-                    },
-                    RequestError.InvalidParams => {
-                        sendErr(w, req.id, .bad_request, "invalid params");
-                    },
-                    RequestError.InvalidCredentials => {
-                        sendErr(w, req.id, .unauthorized, "invalid credentials");
-                    },
-                    RequestError.DbError => {
-                        sendErr(w, req.id, .internal, "db error");
-                    },
-                    RequestError.OutOfMemory => {
-                        sendErr(w, req.id, .internal, "out of memory");
-                        self.oom();
-                    },
-                    else => unreachable,
+                const res = self.login(req) catch |err| {
+                    return self.respondRequestError(w, req.id, err);
                 };
                 self.log(
                     "Logged in user id={d}, role={s}, expires={d}",
@@ -616,27 +603,8 @@ pub const Server = struct {
             },
             .change_password => {
                 const session = sess orelse unreachable;
-                self.changePassword(req, &session) catch |err| switch (err) {
-                    RequestError.MissingParams => {
-                        sendErr(w, req.id, .bad_request, "missing params");
-                    },
-                    RequestError.InvalidParams => {
-                        sendErr(w, req.id, .bad_request, "invalid params");
-                    },
-                    RequestError.InvalidPassword => {
-                        sendErr(w, req.id, .unauthorized, "invalid password");
-                    },
-                    RequestError.UserDoesNotExist => {
-                        sendErr(w, req.id, .internal, "user does not exist");
-                    },
-                    RequestError.DbError => {
-                        sendErr(w, req.id, .internal, "db error");
-                    },
-                    RequestError.OutOfMemory => {
-                        sendErr(w, req.id, .internal, "out of memory");
-                        self.oom();
-                    },
-                    else => unreachable,
+                self.changePassword(req, &session) catch |err| {
+                    return self.respondRequestError(w, req.id, err);
                 };
 
                 return sendOk(w, req.id, .{ .message = "Password changed" });
@@ -651,35 +619,66 @@ pub const Server = struct {
             },
             .state => {
                 const session = sess orelse unreachable;
-                _ = session;
-                // TODO:
-                return sendOk(w, req.id, .{ .balance = 0 });
+                const res = self.trading_service.state(alloc, session.user_id) catch |err| {
+                    return self.respondTradingError(w, req.id, err);
+                };
+                return sendOk(w, req.id, res);
+            },
+            .price => {
+                const params_parsed = parseParams(protocol.PriceParams, alloc, req) catch |err|
+                    return self.respondRequestError(w, req.id, err);
+                defer params_parsed.deinit();
+
+                const res = self.trading_service.price(alloc, params_parsed.value) catch |err| {
+                    return self.respondTradingError(w, req.id, err);
+                };
+                return sendOk(w, req.id, res);
+            },
+            .buy => {
+                const session = sess orelse unreachable;
+                const params_parsed = parseParams(protocol.BuyParams, alloc, req) catch |err|
+                    return self.respondRequestError(w, req.id, err);
+                defer params_parsed.deinit();
+
+                const res = self.trading_service.buy(
+                    alloc,
+                    params_parsed.value,
+                    session.user_id,
+                ) catch |err| return self.respondTradingError(w, req.id, err);
+                return sendOk(w, req.id, res);
+            },
+            .sell => {
+                const session = sess orelse unreachable;
+                const params_parsed = parseParams(protocol.SellParams, alloc, req) catch |err|
+                    return self.respondRequestError(w, req.id, err);
+                defer params_parsed.deinit();
+
+                const res = self.trading_service.sell(
+                    alloc,
+                    params_parsed.value,
+                    session.user_id,
+                ) catch |err| return self.respondTradingError(w, req.id, err);
+                return sendOk(w, req.id, res);
+            },
+            .trade_history => {
+                const session = sess orelse unreachable;
+                const params_parsed = blk: {
+                    if (req.params == null) break :blk null;
+                    break :blk parseParams(protocol.TradeHistoryParams, alloc, req) catch |err|
+                        return self.respondRequestError(w, req.id, err);
+                };
+                defer if (params_parsed) |p| p.deinit();
+
+                const res = self.trading_service.tradeHistory(
+                    alloc,
+                    if (params_parsed) |p| p.value else .{},
+                    session.user_id,
+                ) catch |err| return self.respondTradingError(w, req.id, err);
+                return sendOk(w, req.id, res);
             },
             .create_user => {
-                const user = self.createUser(req) catch |err| return switch (err) {
-                    RequestError.MissingParams => {
-                        sendErr(w, req.id, .bad_request, "missing params");
-                    },
-                    RequestError.InvalidParams => {
-                        sendErr(w, req.id, .bad_request, "invalid params");
-                    },
-                    RequestError.UserExists => {
-                        sendErr(w, req.id, .unauthorized, "user exists with the username");
-                    },
-                    RequestError.InvalidRole => {
-                        sendErr(w, req.id, .unauthorized, "invalid role");
-                    },
-                    RequestError.InvalidPassword => {
-                        sendErr(w, req.id, .unauthorized, "invalid password given");
-                    },
-                    RequestError.DbError => {
-                        sendErr(w, req.id, .internal, "db error");
-                    },
-                    RequestError.OutOfMemory => {
-                        sendErr(w, req.id, .internal, "out of memory");
-                        self.oom();
-                    },
-                    else => unreachable,
+                const user = self.createUser(req) catch |err| {
+                    return self.respondRequestError(w, req.id, err);
                 };
                 return sendOk(w, req.id, .{
                     .message = "User created",
@@ -702,6 +701,66 @@ pub const Server = struct {
         }
 
         return sendErr(w, req.id, .not_found, "unknown method");
+    }
+
+    /// Write ok response with the result content.
+    fn sendOk(w: *std.Io.Writer, id: u64, result: anytype) void {
+        const Out = struct {
+            id: u64,
+            ok: bool = true,
+            result: @TypeOf(result),
+        };
+        std.json.Stringify.value(Out{ .id = id, .result = result }, .{}, w) catch return;
+        w.writeAll("\n") catch return;
+        w.flush() catch return;
+    }
+
+    /// Write error response with error message.
+    fn sendErr(w: *std.Io.Writer, id: u64, code: ErrorCode, message: []const u8) void {
+        const Out = struct {
+            id: u64,
+            ok: bool = false,
+            @"error": protocol.Error,
+        };
+        std.json.Stringify.value(
+            Out{ .id = id, .@"error" = .{ .code = @tagName(code), .message = message } },
+            .{},
+            w,
+        ) catch return;
+        w.writeAll("\n") catch return;
+        w.flush() catch return;
+    }
+
+    fn respondRequestError(self: *Server, w: *std.Io.Writer, id: u64, err: RequestError) void {
+        switch (err) {
+            RequestError.MissingParams => sendErr(w, id, .bad_request, "missing params"),
+            RequestError.InvalidParams => sendErr(w, id, .bad_request, "invalid params"),
+            RequestError.InvalidCredentials => sendErr(w, id, .unauthorized, "invalid credentials"),
+            RequestError.InvalidRole => sendErr(w, id, .unauthorized, "invalid role"),
+            RequestError.InvalidPassword => sendErr(w, id, .unauthorized, "invalid password"),
+            RequestError.UserDoesNotExist => sendErr(w, id, .internal, "user does not exist"),
+            RequestError.UserExists => sendErr(w, id, .conflict, "user exists with the username"),
+            RequestError.DbError => sendErr(w, id, .internal, "db error"),
+            RequestError.OutOfMemory => {
+                sendErr(w, id, .internal, "out of memory");
+                self.oom();
+            },
+        }
+    }
+
+    fn respondTradingError(self: *Server, w: *std.Io.Writer, id: u64, err: trading.Error) void {
+        switch (err) {
+            error.InvalidParams => sendErr(w, id, .bad_request, "invalid params"),
+            error.InvalidAsset => sendErr(w, id, .bad_request, "invalid asset"),
+            error.AmountTooSmall => sendErr(w, id, .bad_request, "amount too small"),
+            error.InsufficientFunds => sendErr(w, id, .unauthorized, "insufficient funds"),
+            error.PriceUnavailable => sendErr(w, id, .internal, "price unavailable"),
+            error.DbError => sendErr(w, id, .internal, "db error"),
+            error.OutOfMemory => {
+                sendErr(w, id, .internal, "out of memory");
+                self.oom();
+            },
+        }
     }
 
     fn log(self: *Server, comptime fmt: []const u8, args: anytype) void {
